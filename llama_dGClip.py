@@ -3,6 +3,7 @@ import os
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments, pipeline, logging
+from transformers import TrainerCallback
 from peft import LoraConfig
 from trl import SFTTrainer
 import torch
@@ -38,12 +39,33 @@ class CustomTrainer(SFTTrainer):
         self.delta = float(delta)
     def create_optimizer(self):
         """Overrides the default optimizer creation with DeltaGclip."""
-        print("Model parameters ",self.model.parameters())
         self.optimizer = dGClip(self.model.parameters(), lr=float(sys.argv[1]),delta=self.delta)
         return self.optimizer
 
 # Load dataset
 dataset = load_dataset(guanaco_dataset, split="train")
+
+
+
+class EpochLossTracker(TrainerCallback):
+    def __init__(self):
+        super().__init__()
+        self.epoch_losses = []  # List to store epoch losses
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        """
+        Callback function to store loss at the end of each epoch.
+        """
+        if state.log_history:  # Ensure there is logged loss data
+            epoch_loss = state.log_history[-1].get("loss", None)
+            if epoch_loss is not None:
+                self.epoch_losses.append(epoch_loss)
+                print(f"Epoch {state.epoch:.0f} - Loss: {epoch_loss:.4f}")
+
+    def get_epoch_losses(self):
+        """Returns the stored losses for analysis."""
+        return self.epoch_losses
+
 
 # 4-bit Quantization Configuration
 compute_dtype = getattr(torch, "float16")
@@ -63,10 +85,10 @@ tokenizer.padding_side = "right"
 peft_params = LoraConfig(lora_alpha=16, lora_dropout=0.1, r=64, bias="none", task_type="CAUSAL_LM")
 
 # Define training parameters
-training_params = TrainingArguments(output_dir="./results", num_train_epochs=2, per_device_train_batch_size=10, gradient_accumulation_steps=1, save_steps=300, logging_steps=300, learning_rate=2e-4, weight_decay=0.001, fp16=False, bf16=False, max_grad_norm=0.3, max_steps=-1, warmup_ratio=0.03, group_by_length=True, lr_scheduler_type="constant", report_to="tensorboard")
+training_params = TrainingArguments(output_dir="./results", num_train_epochs=3, per_device_train_batch_size=10, gradient_accumulation_steps=1, save_steps=300, logging_steps=300, learning_rate=2e-4, weight_decay=0.001, fp16=False, bf16=False, max_grad_norm=0.3, max_steps=-1, warmup_ratio=0.03, group_by_length=True, lr_scheduler_type="constant", report_to="tensorboard")
 
 # Initialize the trainer
-trainer = CustomTrainer(model=model,delta=sys.argv[2], train_dataset=dataset, peft_config=peft_params, dataset_text_field="text", max_seq_length=None, tokenizer=tokenizer, args=training_params, packing=False)
+trainer = CustomTrainer(model=model,delta=sys.argv[2], train_dataset=dataset, peft_config=peft_params, dataset_text_field="text", max_seq_length=None, tokenizer=tokenizer, args=training_params, packing=False, callbacks=[loss_tracker])
 
 #Force clean the pytorch cache
 gc.collect()
@@ -75,7 +97,19 @@ torch.cuda.empty_cache()
 
 # Train the model
 output=trainer.train()
+epoch_losses = loss_tracker.get_epoch_losses()
 print("loss printed: ", output.training_loss)
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# define data values
+x = np.array([1, 2, 3])  # X-axis points
+y = epoch_losses  # Y-axis points
+
+plt.plot(x, y)
+plt.savefig("lr_"+sys.argv[2]+".png")
+
 
 # Save the model and tokenizer
 trainer.model.save_pretrained(new_model)
